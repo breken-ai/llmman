@@ -3379,6 +3379,73 @@ async fn ollama_chat_with_no_messages_loads_without_generating() {
     );
 }
 
+/// ollama-python's tool loop sends the assistant turn back without the
+/// calls' ids and each result with only `tool_name`. The chat request
+/// `/api/chat` builds must still tie every result to its call by id, or an
+/// OpenAI-wire provider rejects it ("messages with role 'tool' must be a
+/// response to a preceding message with 'tool_calls'").
+#[tokio::test(flavor = "multi_thread")]
+async fn ollama_chat_ties_tool_results_without_ids_to_their_calls() {
+    let (sent_tx, sent_rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
+    let sent_tx = Arc::new(std::sync::Mutex::new(Some(sent_tx)));
+    let upstream = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move |Json(body): Json<serde_json::Value>| async move {
+            if let Some(tx) = sent_tx.lock().unwrap().take() {
+                let _ = tx.send(body);
+            }
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+    let state = test_state();
+    {
+        let mut running = running_model_fixture(Some(DEFAULT_KEEP_ALIVE), Duration::ZERO, 0);
+        running.port = port;
+        let mut mgr = state.0.manager.lock().await;
+        mgr.running.insert("docker.io/ai/m:latest".into(), running);
+    }
+    let call = |name: &str| serde_json::json!({ "function": { "name": name, "arguments": {} } });
+    handle_ollama_chat(
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(chat_request(serde_json::json!({
+            "model": "docker.io/ai/m:latest",
+            "stream": false,
+            "messages": [
+                { "role": "user", "content": "weather in paris and rome, and the time?" },
+                { "role": "assistant", "content": "", "tool_calls": [call("weather"), call("weather"), call("clock")] },
+                { "role": "tool", "content": "sunny", "tool_name": "weather" },
+                { "role": "tool", "content": "rain", "tool_name": "weather" },
+                { "role": "tool", "content": "noon", "tool_name": "clock" },
+            ],
+        }))),
+    )
+    .await
+    .expect("chat must succeed");
+
+    let sent = sent_rx.await.unwrap();
+    let messages = sent["messages"].as_array().unwrap();
+    let calls: Vec<&str> = messages[1]["tool_calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    let answers: Vec<Option<&str>> = messages[2..]
+        .iter()
+        .map(|m| m["tool_call_id"].as_str())
+        .collect();
+    assert_eq!(
+        answers,
+        calls.iter().copied().map(Some).collect::<Vec<_>>(),
+        "{sent}"
+    );
+}
+
 // -- vLLM-Omni (Diffusers-layout models) -----------------------------------
 
 #[test]

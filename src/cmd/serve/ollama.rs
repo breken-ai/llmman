@@ -1135,7 +1135,7 @@ async fn ollama_chat_to(
     let wire_model = backend_wire_model(state, &target, &model).await;
     let oai = OAIChatRequest {
         model: wire_model,
-        messages: req.messages.iter().map(ollama_message_to_oai).collect(),
+        messages: ollama_messages_to_oai(&req.messages),
         stream: true,
         chat_template_kwargs: think_to_chat_template_kwargs(&req.think),
         tools: req.tools.clone(),

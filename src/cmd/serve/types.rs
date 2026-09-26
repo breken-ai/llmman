@@ -545,6 +545,48 @@ pub(super) fn ollama_message_to_oai(m: &OllamaMessage) -> OAIMessage {
     }
 }
 
+/// [`ollama_message_to_oai`] over a whole conversation, then a
+/// `tool_call_id` for each tool result that has none. ollama-python and
+/// older clients send only `tool_name`, and drop the calls' ids on the
+/// way back, so the ids above are new. llama-server doesn't mind, but an
+/// OpenAI-wire provider rejects a tool message that answers no call. Such
+/// a result answers the first unanswered call of its name (or of any
+/// name) in the assistant turn before it, as `anthropic::unanswered_call`
+/// matches them.
+pub(super) fn ollama_messages_to_oai(messages: &[OllamaMessage]) -> Vec<OAIMessage> {
+    let mut out: Vec<OAIMessage> = messages.iter().map(ollama_message_to_oai).collect();
+    let mut turn: Option<usize> = None;
+    let mut answered: Vec<String> = Vec::new();
+    for i in 0..out.len() {
+        match out[i].role.as_str() {
+            "assistant" => {
+                turn = Some(i);
+                answered.clear();
+            }
+            "tool" => {
+                if let Some(id) = out[i].tool_call_id.clone().filter(|id| !id.is_empty()) {
+                    answered.push(id);
+                    continue;
+                }
+                let name = out[i].name.clone();
+                let id = turn
+                    .and_then(|t| out[t].tool_calls.as_ref())
+                    .into_iter()
+                    .flatten()
+                    .filter(|c| name.as_ref().is_none_or(|n| &c.function.name == n))
+                    .map(|c| c.id.clone())
+                    .find(|id| !answered.contains(id));
+                if let Some(id) = id {
+                    answered.push(id.clone());
+                    out[i].tool_call_id = Some(id);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Wraps a bare base64 image (Ollama's own `images` wire format) in a
 /// `data:` URI for llama-server's OpenAI-compatible `image_url` content
 /// part. `image/png` is a placeholder mime type — llama.cpp's clip
