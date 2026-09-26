@@ -116,8 +116,24 @@ fn spawn_tail_relay(
     to_stderr: bool,
 ) {
     tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        // Bytes, not `lines()`: that stops at the first line that isn't
+        // UTF-8, which dropped the pipe under a still-running child (its
+        // next write got SIGPIPE) and lost every later line, the crash
+        // reason included.
+        let mut reader = BufReader::new(reader);
+        let mut bytes = Vec::new();
+        loop {
+            bytes.clear();
+            match reader.read_until(b'\n', &mut bytes).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let line = String::from_utf8_lossy(&bytes);
+            let line = line
+                .strip_suffix('\n')
+                .map(|l| l.strip_suffix('\r').unwrap_or(l))
+                .unwrap_or(&line)
+                .to_string();
             if to_stderr {
                 eprintln!("{line}");
             } else {
@@ -1095,5 +1111,75 @@ mod tests {
         std::fs::write(&script, b"\x7fELF\x02\x01\x01").unwrap();
         assert_eq!(console_script_interpreter(&script), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spawns `sh -c script` with piped output, relayed through
+    /// [`tail_child_output`] as `ensure_model` does.
+    #[cfg(unix)]
+    fn spawn_piped_sh(script: &str) -> (tokio::process::Child, OutputTail) {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", script])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let tail = tail_child_output(&mut child);
+        (child, tail)
+    }
+
+    /// Waits (bounded) for the relay tasks to drain what the child wrote.
+    #[cfg(unix)]
+    async fn tail_lines_once_drained(tail: &OutputTail, want: &str) -> Vec<String> {
+        for _ in 0..100 {
+            let lines: Vec<String> = tail.lock().unwrap().iter().cloned().collect();
+            if lines.iter().any(|l| l.contains(want)) {
+                return lines;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        tail.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// A backend line that is not UTF-8 (a Latin-1 path, a Windows
+    /// code-page error message, a byte-fallback token in a verbose log)
+    /// must not end the relay: the crash reason printed after it still
+    /// belongs in the tail `wait_for_ready` reports.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_tail_keeps_lines_after_one_that_is_not_utf8() {
+        let (mut child, tail) = spawn_piped_sh(
+            r"printf 'loading /models/caf\351.gguf\n' >&2; echo 'error: failed to load model' >&2; exit 1",
+        );
+        child.wait().await.unwrap();
+        let lines = tail_lines_once_drained(&tail, "failed to load model").await;
+        assert_eq!(
+            lines,
+            [
+                "loading /models/caf\u{FFFD}.gguf",
+                "error: failed to load model"
+            ],
+        );
+    }
+
+    /// Nor may it close the pipe under a backend that is still running:
+    /// its next write would get SIGPIPE and kill it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_line_that_is_not_utf8_does_not_kill_the_backend() {
+        use std::os::unix::process::ExitStatusExt;
+        let (mut child, tail) =
+            spawn_piped_sh(r"printf '\377\n' >&2; sleep 0.5; echo 'still serving' >&2; exit 0");
+        let status = child.wait().await.unwrap();
+        assert_eq!(
+            (status.code(), status.signal()),
+            (Some(0), None),
+            "backend was killed; tail: {:?}",
+            tail.lock().unwrap()
+        );
+        assert!(tail_lines_once_drained(&tail, "still serving")
+            .await
+            .iter()
+            .any(|l| l == "still serving"));
     }
 }
