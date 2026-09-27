@@ -827,14 +827,33 @@ fn git_metadata_paths(workspace: &Path) -> anyhow::Result<Vec<(PathBuf, PathBuf)
         let common_guest = if common.is_absolute() {
             common.to_path_buf()
         } else {
-            let mut ancestor = Some(git_guest.as_path());
-            while let Some(path) = ancestor {
-                anyhow::ensure!(
-                    !std::fs::symlink_metadata(path)?.file_type().is_symlink(),
-                    "cannot safely mount relative Git common directory through symlinked gitdir path {}",
-                    git_guest.display()
-                );
-                ancestor = path.parent();
+            // Reject symlinks only on the relative traversal from git_guest
+            // to common_guest. A symlink shared by both paths is harmless:
+            // the container mounts both destinations in the same alias tree.
+            let mut path = git_guest.clone();
+            for component in common.components() {
+                match component {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        anyhow::ensure!(
+                            !std::fs::symlink_metadata(&path)?.file_type().is_symlink(),
+                            "cannot safely mount relative Git common directory through symlinked gitdir path {}",
+                            git_guest.display()
+                        );
+                        path.pop();
+                    }
+                    std::path::Component::Normal(name) => {
+                        anyhow::ensure!(
+                            !std::fs::symlink_metadata(&path)?.file_type().is_symlink(),
+                            "cannot safely mount relative Git common directory through symlinked gitdir path {}",
+                            git_guest.display()
+                        );
+                        path.push(name);
+                    }
+                    std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                        anyhow::bail!("relative Git common directory has an absolute component")
+                    }
+                }
             }
             git_guest.join(common)
         };
@@ -1542,6 +1561,127 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_plan_allows_shared_symlinked_ancestor_for_relative_commondir() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("linked-worktree-shared-ancestor-symlink");
+        let repo = root.join("repo");
+        let worktree = root.join("worktree");
+        let root_alias = root.with_file_name(format!(
+            "{}-alias",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .expect("git should be installed for this test");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("README.md"), "worktree").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=llmman test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "initial",
+                "--quiet",
+            ],
+        );
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked",
+                worktree.to_str().unwrap(),
+                "--quiet",
+            ],
+        );
+        symlink(&root, &root_alias).unwrap();
+        let git_dir = PathBuf::from(git(
+            &worktree,
+            &["rev-parse", "--path-format=absolute", "--git-dir"],
+        ))
+        .canonicalize()
+        .unwrap();
+        let git_guest = root_alias
+            .join("repo")
+            .join(".git/worktrees")
+            .join(git_dir.file_name().unwrap());
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", git_guest.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            git(&worktree, &["rev-parse", "--show-toplevel"]),
+            worktree.canonicalize().unwrap().display().to_string()
+        );
+
+        let active = Active {
+            sandbox: Sandbox::Docker,
+            integration: format!("worktree-shared-ancestor-test-{}", std::process::id()),
+            server: "http://127.0.0.1:17434".into(),
+            workspace: worktree,
+            home: dirs::home_dir().unwrap(),
+            image: Some("test/image".into()),
+            state: vec![],
+        };
+        let plan = plan(&active, Path::new("codex"), &[], &[])
+            .expect("a shared symlinked ancestor must not invalidate relative commondir");
+        let common = git_dir
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+        let common_guest = git_guest.join("../..");
+        assert!(
+            plan.mounts.iter().any(|mount| {
+                mount.host == git_dir.to_string_lossy()
+                    && mount.guest == git_guest.to_string_lossy()
+                    && mount.read_only
+            }),
+            "missing read-only gitdir mount at alias: {:?}",
+            plan.mounts
+                .iter()
+                .map(|m| (&m.host, &m.guest, m.read_only))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            plan.mounts.iter().any(|mount| {
+                mount.host == common.to_string_lossy()
+                    && mount.guest == common_guest.to_string_lossy()
+                    && mount.read_only
+            }),
+            "missing read-only common metadata mount at alias-relative path: {:?}",
+            plan.mounts
+                .iter()
+                .map(|m| (&m.host, &m.guest, m.read_only))
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&root_alias);
         let _ = std::fs::remove_dir_all(&root);
     }
 
