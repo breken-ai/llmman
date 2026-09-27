@@ -759,11 +759,23 @@ fn mount_path(path: &Path) -> anyhow::Result<String> {
 /// have a `commondir` file pointing at the shared object database and refs.
 fn git_metadata_paths(workspace: &Path) -> anyhow::Result<Vec<(PathBuf, PathBuf)>> {
     let dot_git = workspace.join(".git");
-    if !dot_git.exists() {
-        return Ok(Vec::new());
-    }
+    let dot_git_metadata = match std::fs::symlink_metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect Git metadata path {}", dot_git.display()));
+        }
+    };
+    // The workspace itself is mounted writable into the sandbox. Never follow
+    // a workspace-controlled `.git` symlink into an arbitrary host directory.
+    anyhow::ensure!(
+        !dot_git_metadata.file_type().is_symlink(),
+        "Git metadata path {} must not be a symlink",
+        dot_git.display()
+    );
     let mut paths = vec![(dot_git.clone(), dot_git.clone())];
-    if !dot_git.is_file() {
+    if !dot_git_metadata.is_file() {
         return Ok(paths);
     }
 
@@ -1792,6 +1804,37 @@ mod tests {
         };
 
         assert!(plan(&active, Path::new("codex"), &[], &[]).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_plan_rejects_a_symlinked_git_directory_to_host_ssh() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("symlinked-git-directory");
+        let workspace = root.join("workspace");
+        let home = root.join("home");
+        let ssh = home.join(".ssh");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::write(ssh.join("id_ed25519"), "private key").unwrap();
+        symlink(&ssh, workspace.join(".git")).unwrap();
+
+        let active = Active {
+            sandbox: Sandbox::Docker,
+            integration: format!("symlinked-git-directory-test-{}", std::process::id()),
+            server: "http://127.0.0.1:17434".into(),
+            workspace,
+            home,
+            image: Some("test/image".into()),
+            state: vec![],
+        };
+
+        assert!(
+            plan(&active, Path::new("codex"), &[], &[]).is_err(),
+            "a symlinked .git directory must not expose host metadata to the sandbox"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
