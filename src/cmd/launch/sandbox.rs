@@ -827,13 +827,15 @@ fn git_metadata_paths(workspace: &Path) -> anyhow::Result<Vec<(PathBuf, PathBuf)
         let common_guest = if common.is_absolute() {
             common.to_path_buf()
         } else {
-            anyhow::ensure!(
-                !std::fs::symlink_metadata(&git_guest)?
-                    .file_type()
-                    .is_symlink(),
-                "cannot safely mount relative Git common directory for symlinked gitdir {}",
-                git_guest.display()
-            );
+            let mut ancestor = Some(git_guest.as_path());
+            while let Some(path) = ancestor {
+                anyhow::ensure!(
+                    !std::fs::symlink_metadata(path)?.file_type().is_symlink(),
+                    "cannot safely mount relative Git common directory through symlinked gitdir path {}",
+                    git_guest.display()
+                );
+                ancestor = path.parent();
+            }
             git_guest.join(common)
         };
         anyhow::ensure!(
@@ -1540,6 +1542,84 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_plan_rejects_relative_commondir_through_symlinked_gitdir_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("linked-worktree-ancestor-symlink");
+        let repo = root.join("repo");
+        let worktree = root.join("worktree");
+        let gitdir_parent_alias = root.join("gitdir-parent-alias");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .expect("git should be installed for this test");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("README.md"), "worktree").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=llmman test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "initial",
+                "--quiet",
+            ],
+        );
+        git(
+            &repo,
+            &["worktree", "add", "-b", "linked", "../worktree", "--quiet"],
+        );
+
+        let git_dir = PathBuf::from(git(
+            &worktree,
+            &["rev-parse", "--path-format=absolute", "--git-dir"],
+        ))
+        .canonicalize()
+        .unwrap();
+        symlink(git_dir.parent().unwrap(), &gitdir_parent_alias).unwrap();
+        let git_guest = gitdir_parent_alias.join(git_dir.file_name().unwrap());
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", git_guest.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            git(&worktree, &["rev-parse", "--show-toplevel"]),
+            worktree.canonicalize().unwrap().display().to_string()
+        );
+
+        let active = Active {
+            sandbox: Sandbox::Docker,
+            integration: format!("worktree-ancestor-symlink-test-{}", std::process::id()),
+            server: "http://127.0.0.1:17434".into(),
+            workspace: worktree,
+            home: dirs::home_dir().unwrap(),
+            image: Some("test/image".into()),
+            state: vec![],
+        };
+        assert!(
+            plan(&active, Path::new("codex"), &[], &[]).is_err(),
+            "relative commondir through a symlinked gitdir ancestor must fail closed"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
