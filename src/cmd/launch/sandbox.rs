@@ -1353,11 +1353,11 @@ mod tests {
             };
             let plan = plan(&active, Path::new("codex"), &[], &[]).unwrap();
             for metadata in metadata_paths {
+                let host = metadata.canonicalize().unwrap().to_string_lossy().into_owned();
+                let guest = metadata.to_string_lossy().into_owned();
                 assert!(
                     plan.mounts.iter().any(|mount| {
-                        mount.host == metadata.to_string_lossy()
-                            && mount.guest == metadata.to_string_lossy()
-                            && mount.read_only
+                        mount.host == host && mount.guest == guest && mount.read_only
                     }),
                     "missing read-only git metadata mount for {}: {:?}",
                     metadata.display(),
