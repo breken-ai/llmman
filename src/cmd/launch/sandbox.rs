@@ -1315,18 +1315,6 @@ mod tests {
             &["worktree", "add", "-b", "linked", "../worktree", "--quiet"],
         );
 
-        let home = dirs::home_dir().unwrap();
-        let workspace = workspace(&worktree, &home).unwrap();
-        let active = Active {
-            sandbox: Sandbox::Docker,
-            integration: format!("worktree-test-{}", std::process::id()),
-            server: "http://127.0.0.1:17434".into(),
-            workspace,
-            home,
-            image: Some("test/image".into()),
-            state: vec![],
-        };
-        let plan = plan(&active, Path::new("codex"), &[], &[]).unwrap();
         let git_dir = PathBuf::from(git(
             &worktree,
             &["rev-parse", "--path-format=absolute", "--git-dir"],
@@ -1336,20 +1324,49 @@ mod tests {
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         ));
 
+        // Windows drive letters are rejected by the existing `mount_path` contract
+        // before a container plan can be built. Still check real Git worktree
+        // pointers there; assert the resulting read-only mounts on Unix.
+        let metadata_paths = git_metadata_paths(&worktree).unwrap();
+        assert_eq!(metadata_paths[0], worktree.join(".git"));
         for metadata in [git_dir, common_dir] {
+            let metadata = metadata.canonicalize().unwrap();
             assert!(
-                plan.mounts.iter().any(|mount| {
-                    mount.host == metadata.to_string_lossy()
-                        && mount.guest == metadata.to_string_lossy()
-                        && mount.read_only
-                }),
-                "missing read-only git metadata mount for {}: {:?}",
-                metadata.display(),
-                plan.mounts
-                    .iter()
-                    .map(|m| (&m.host, &m.guest, m.read_only))
-                    .collect::<Vec<_>>()
+                metadata_paths.contains(&metadata),
+                "missing Git metadata path {}: {metadata_paths:?}",
+                metadata.display()
             );
+        }
+
+        #[cfg(not(windows))]
+        {
+            let home = dirs::home_dir().unwrap();
+            let workspace = workspace(&worktree, &home).unwrap();
+            let active = Active {
+                sandbox: Sandbox::Docker,
+                integration: format!("worktree-test-{}", std::process::id()),
+                server: "http://127.0.0.1:17434".into(),
+                workspace,
+                home,
+                image: Some("test/image".into()),
+                state: vec![],
+            };
+            let plan = plan(&active, Path::new("codex"), &[], &[]).unwrap();
+            for metadata in metadata_paths {
+                assert!(
+                    plan.mounts.iter().any(|mount| {
+                        mount.host == metadata.to_string_lossy()
+                            && mount.guest == metadata.to_string_lossy()
+                            && mount.read_only
+                    }),
+                    "missing read-only git metadata mount for {}: {:?}",
+                    metadata.display(),
+                    plan.mounts
+                        .iter()
+                        .map(|m| (&m.host, &m.guest, m.read_only))
+                        .collect::<Vec<_>>()
+                );
+            }
         }
         let _ = std::fs::remove_dir_all(&root);
     }
