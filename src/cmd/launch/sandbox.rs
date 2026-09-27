@@ -820,11 +820,21 @@ fn git_metadata_paths(workspace: &Path) -> anyhow::Result<Vec<(PathBuf, PathBuf)
             "Git metadata directory {} does not point back to this workspace",
             git_dir.display()
         );
+        let worktrees_dir = git_dir
+            .parent()
+            .context("Git metadata directory has no parent")?;
         anyhow::ensure!(
-            git_dir
-                .parent()
-                .and_then(Path::parent)
-                .is_some_and(|p| p.join("objects").is_dir()),
+            worktrees_dir
+                .file_name()
+                .is_some_and(|name| name == "worktrees"),
+            "Git metadata directory {} is not below a Git worktrees directory",
+            git_dir.display()
+        );
+        let common_dir = worktrees_dir
+            .parent()
+            .context("Git worktrees directory has no common directory")?;
+        anyhow::ensure!(
+            common_dir.join("objects").is_dir(),
             "Git metadata directory {} is not below a Git common directory",
             git_dir.display()
         );
@@ -867,6 +877,11 @@ fn git_metadata_paths(workspace: &Path) -> anyhow::Result<Vec<(PathBuf, PathBuf)
                     }
                 }
             }
+            anyhow::ensure!(
+                !std::fs::symlink_metadata(&path)?.file_type().is_symlink(),
+                "cannot safely mount relative Git common directory through symlinked gitdir path {}",
+                git_guest.display()
+            );
             git_guest.join(common)
         };
         anyhow::ensure!(
@@ -1863,6 +1878,88 @@ mod tests {
         };
 
         assert!(plan(&active, Path::new("codex"), &[], &[]).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn container_plan_rejects_external_gitdir_outside_worktrees_without_commondir() {
+        let root = temp_dir("external-gitdir-outside-worktrees");
+        let workspace = root.join("workspace");
+        let git_dir = root.join("host/metadata/arbitrary/gitdir");
+        let dot_git = workspace.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::create_dir_all(root.join("host/metadata/objects")).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(&dot_git, format!("gitdir: {}\n", git_dir.display())).unwrap();
+        std::fs::write(git_dir.join("gitdir"), format!("{}\n", dot_git.display())).unwrap();
+
+        assert!(
+            git_metadata_paths(&workspace).is_err(),
+            "external Git metadata without the common/worktrees/name layout must be rejected"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn container_plan_rejects_symlinked_final_component_of_relative_commondir() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("linked-worktree-final-commondir-symlink");
+        let repo = root.join("repo");
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .expect("git should be installed for this test");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("README.md"), "worktree").unwrap();
+        git(&repo, &["add", "README.md"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=llmman test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "initial",
+                "--quiet",
+            ],
+        );
+        git(
+            &repo,
+            &["worktree", "add", "-b", "linked", "../worktree", "--quiet"],
+        );
+
+        let git_dir = PathBuf::from(git(
+            &worktree,
+            &["rev-parse", "--path-format=absolute", "--git-dir"],
+        ));
+        let common_dir = PathBuf::from(git(
+            &worktree,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ));
+        let worktrees = git_dir.parent().unwrap();
+        let common_alias = worktrees.join("common-alias");
+        symlink(&common_dir, &common_alias).unwrap();
+        std::fs::write(git_dir.join("commondir"), "../common-alias\n").unwrap();
+
+        assert!(
+            git_metadata_paths(&worktree).is_err(),
+            "a relative commondir whose final component is a symlink must fail closed"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
